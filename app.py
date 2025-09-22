@@ -179,7 +179,11 @@ if "peakcurrent" in view.columns:
     size = np.clip(np.log1p(np.abs(view["peakcurrent"])).fillna(0), 1, None)
 else:
     size = pd.Series(5, index=view.index)
-color = view["class"].map({"IC": [0, 128, 255, 140], "CG": [255, 80, 0, 160]}).fillna([180, 180, 180, 140])
+color_map = {"IC": [0, 128, 255, 140], "CG": [255, 80, 0, 160]}
+default_color = [180, 180, 180, 140]
+color_series = view["class"].map(color_map)
+color = color_series.apply(lambda x: x if isinstance(x, list) else default_color)
+
 
 scatter = pdk.Layer(
     "ScatterplotLayer",
