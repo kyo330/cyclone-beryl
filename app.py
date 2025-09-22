@@ -81,15 +81,15 @@ def load_csvs(file_objs):
         df["polarity"] = "Unknown"
 
     if "type" in df.columns:
-        df["class"] = df["type"].map({0: "CG", 1: "IC"})
-        df["class"] = df["class"].astype("string").fillna("Unknown")
+        # 0=CG, 1=IC (common ENTLN convention — adjust if your files differ)
+        df["class"] = df["type"].map({0: "CG", 1: "IC"}).astype("string").fillna("Unknown")
     else:
         df["class"] = "Unknown"
 
     # Convenience columns
-    df["date"] = df["time_utc"].dt.date
     df["hour"] = df["time_utc"].dt.floor("h")
     df["minute"] = df["time_utc"].dt.floor("min")
+
     return df
 
 df = load_csvs(files)
@@ -190,6 +190,9 @@ else:
     frame_time = None
     frame_view = view.copy()
 
+# IMPORTANT: avoid tz objects in Deck data — use a string for tooltips
+frame_view["time_str"] = frame_view["time_utc"].dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+
 st.caption(f"Current frame: {frame_time}" if frame_time is not None else "Current frame: (all)")
 
 # ----------------------------
@@ -223,7 +226,6 @@ else:
 # Robust color mapping (no fillna(list))
 color_map = {"IC": [0, 128, 255, 140], "CG": [255, 80, 0, 160]}
 default_color = [180, 180, 180, 140]
-# align index to avoid broadcasting issues
 class_series = frame_view["class"].astype("string").fillna("Unknown")
 mapped = class_series.map(color_map)
 color = mapped.apply(lambda v: v if isinstance(v, list) else default_color)
@@ -266,7 +268,7 @@ elif map_mode == "Heatmap":
             "HeatmapLayer",
             data=frame_view,
             get_position=["longitude", "latitude"],
-            aggregation=pdk.types.String("MEAN"),
+            # NOTE: removed aggregation=pdk.types.String("MEAN") to avoid serialization issues
         )
     )
 
@@ -290,7 +292,8 @@ elif map_mode == "3D Columns":
     )
 
 tooltip = {
-    "text": "{class} | {polarity}\n{time_utc}\nI: {peakcurrent} A\nh: {icheight} m"
+    # use time_str (plain string) to avoid tz-aware objects in deck JSON
+    "text": "{class} | {polarity}\n{time_str}\nI: {peakcurrent} A\nh: {icheight} m"
 }
 
 st.pydeck_chart(
