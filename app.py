@@ -1,4 +1,3 @@
-# app.py
 import streamlit as st
 from streamlit.components.v1 import html as st_html
 import pandas as pd
@@ -13,7 +12,7 @@ with col1:
     upl_points = st.file_uploader(
         "Upload Lightning Strikes (.dat from HLMA/LMA export)",
         type=["dat"],
-        help="Upload the exported .dat file. We'll parse numeric rows and auto-detect lat/lon/alt (and time if present)."
+        help="We parse numeric rows and infer lat/lon/alt (+ optional time)."
     )
 with col2:
     upl_winds = st.file_uploader(
@@ -31,19 +30,23 @@ def _find_col(cols, aliases):
     return None
 
 def _is_float_token(t: str) -> bool:
-    return re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", t or "") is not None
+    return re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", (t or "").strip()) is not None
 
 def parse_lma_dat(file) -> pd.DataFrame | None:
     """
     Heuristic parser for HLMA/LMA .dat exports.
-    - Reads lines, keeps rows that start with numeric and contain >=4 numeric tokens.
-    - Builds a numeric matrix and infers lat, lon, alt, time columns.
-    Returns DataFrame with columns: lat, lon, alt (meters), time (str, optional).
+    - Reads bytes once (file.getvalue()), decodes (ascii→utf-8 fallback)
+    - Keeps lines that begin with a number and contain >=4 numeric tokens
+    - Infers lat, lon, alt (m), and optional time column
     """
+    if not file:
+        return None
+
+    raw = file.getvalue()  # <- robust for Streamlit reruns
     try:
-        text = file.read().decode("ascii", errors="replace")
+        text = raw.decode("ascii", errors="replace")
     except Exception:
-        text = file.read().decode("utf-8", errors="replace")
+        text = raw.decode("utf-8", errors="replace")
 
     rows = []
     for ln in text.splitlines():
@@ -54,102 +57,94 @@ def parse_lma_dat(file) -> pd.DataFrame | None:
         if len(toks) < 4:
             continue
         if not _is_float_token(toks[0]):
-            # header or comment
-            continue
+            continue  # header/comment lines
         num_toks = [t for t in toks if _is_float_token(t)]
         if len(num_toks) < 4:
             continue
-        rows.append([float(t) if _is_float_token(t) else None for t in toks])
+        # keep as floats where possible
+        row = []
+        for t in toks:
+            if _is_float_token(t):
+                try:
+                    row.append(float(t))
+                except Exception:
+                    row.append(None)
+            else:
+                row.append(None)
+        rows.append(row)
 
     if not rows:
-        st.error("Could not find numeric data rows in the .dat file.")
+        st.error("No numeric data rows detected in the .dat file. If your .dat is fixed-width or different schema, I can add a manual column mapper.")
         return None
 
-    # pad to same width
     max_cols = max(len(r) for r in rows)
     rows = [r + [None]*(max_cols - len(r)) for r in rows]
     df = pd.DataFrame(rows, columns=[f"c{i+1}" for i in range(max_cols)])
 
-    # infer lat/lon candidates
+    # inference helpers
     def in_range(series, lo, hi, min_ratio=0.9):
-        s = series.dropna()
-        if s.empty:
-            return False
+        s = pd.to_numeric(series, errors="coerce").dropna()
+        if s.empty: return False
         return (s.between(lo, hi).mean() >= min_ratio) and (s.std() > 1e-6)
 
     lat_cands = [c for c in df.columns if in_range(df[c], -90, 90)]
     lon_cands = [c for c in df.columns if in_range(df[c], -180, 180)]
 
-    # If multiple candidates, pick pair that correlates (rough heuristic: not identical and reasonable variance)
     lat_col = lat_cands[0] if lat_cands else None
     lon_col = lon_cands[0] if lon_cands else None
 
-    # altitude: positive, likely < 30 km if in meters (30000), or < 30 if km
-    alt_cands = []
+    # altitude candidates: mostly positive
+    alt_cols = []
     for c in df.columns:
-        s = df[c].dropna()
-        if s.empty: 
-            continue
-        pos_ratio = (s > 0).mean()
-        if pos_ratio >= 0.95:
-            alt_cands.append(c)
-    # prefer column with median between ~100 and ~30000 (meters)
+        s = pd.to_numeric(df[c], errors="coerce").dropna()
+        if not s.empty and (s > 0).mean() >= 0.95:
+            alt_cols.append(c)
+
     def alt_score(series):
-        s = series.dropna()
+        s = pd.to_numeric(series, errors="coerce").dropna()
+        if s.empty: return 0
         med = s.median()
-        if 50 <= med <= 30000: return 2
-        if 0.05 <= med <= 50:  return 1  # likely km; will convert
+        if 50 <= med <= 30000: return 2  # meters
+        if 0.05 <= med <= 50:  return 1  # likely km
         return 0
 
-    alt_col = None
     best = (-1, None)
-    for c in alt_cands:
+    for c in alt_cols:
         sc = alt_score(df[c])
         if sc > best[0]:
             best = (sc, c)
     alt_col = best[1]
 
-    # time: monotonic-ish increasing for many rows (seconds)
-    time_col = None
-    best_time_score = -1
+    # time: roughly non-decreasing sequence
+    time_col, best_time_score = None, -1
     for c in df.columns:
-        s = df[c].dropna().astype(float)
-        if len(s) < 10:
-            continue
+        s = pd.to_numeric(df[c], errors="coerce").dropna()
+        if len(s) < 10: continue
         diffs = s.diff().dropna()
-        if len(diffs) == 0:
-            continue
+        if len(diffs) == 0: continue
         inc_ratio = (diffs >= 0).mean()
         if inc_ratio > best_time_score and inc_ratio >= 0.6:
-            best_time_score = inc_ratio
-            time_col = c
+            best_time_score, time_col = inc_ratio, c
 
     if not (lat_col and lon_col and alt_col):
-        st.error(f"Failed to infer columns. Found lat candidates={lat_cands}, lon candidates={lon_cands}, alt candidates={alt_cands}.")
+        st.error(f"Failed to infer columns.\nLat candidates: {lat_cands}\nLon candidates: {lon_cands}\nAlt candidates: {alt_cols}")
         return None
 
     out = pd.DataFrame({
-        "lat": df[lat_col],
-        "lon": df[lon_col],
-        "alt": df[alt_col],
-    }).dropna(subset=["lat", "lon", "alt"]).copy()
+        "lat": pd.to_numeric(df[lat_col], errors="coerce"),
+        "lon": pd.to_numeric(df[lon_col], errors="coerce"),
+        "alt": pd.to_numeric(df[alt_col], errors="coerce"),
+    }).dropna(subset=["lat", "lon", "alt"])
 
-    # Convert altitude to meters if it looks like km
-    # If 80% of values are < 50, treat as km and convert
-    s = out["alt"].dropna()
-    if not s.empty and (s < 50).mean() >= 0.8:
+    # convert km→m if most altitudes < 50
+    s_alt = out["alt"].dropna()
+    if not s_alt.empty and (s_alt < 50).mean() >= 0.8:
         out["alt"] = out["alt"] * 1000.0
 
-    # time column to ISO-friendly string if present
-    if time_col:
-        # keep as numeric seconds; JS will try to parse as Date(..) if > 1e10 epoch ms, so leave a string
-        out["time"] = df[time_col].astype(str)
-    else:
-        out["time"] = ""
-
+    out["time"] = df[time_col].astype(str) if time_col else ""
     return out
 
-def load_wind_df(file):
+def parse_wind_csv(file):
     if not file:
         return None
     df = pd.read_csv(file)
@@ -158,7 +153,7 @@ def load_wind_df(file):
     com_c = _find_col(df.columns, ["Comments", "Comment", "Remark", "Remarks", "Desc", "Description"])
     time_c = _find_col(df.columns, ["Time", "Valid", "IssueTime", "Date", "Datetime", "timestamp", "time"])
     if not (lat_c and lon_c):
-        st.info("Storm report CSV has no Lat/Lon columns; wind layer will be empty.")
+        st.error("Storm report CSV is missing Lat/Lon; please include those.")
         return None
     out = pd.DataFrame({
         "Lat": pd.to_numeric(df[lat_c], errors="coerce"),
@@ -168,16 +163,32 @@ def load_wind_df(file):
     }).dropna(subset=["Lat", "Lon"])
     return out
 
+# ───────────── Parse uploads + SHOW PREVIEWS (this is what you asked to see) ─────────────
 points_df = parse_lma_dat(upl_points) if upl_points else None
-winds_df  = load_wind_df(upl_winds) if upl_winds else None
+winds_df  = parse_wind_csv(upl_winds) if upl_winds else None
 
+with st.expander("Parsed lightning strikes (.dat) — preview", expanded=True):
+    if points_df is not None and not points_df.empty:
+        st.write(f"Rows: {len(points_df):,}  |  Columns: {list(points_df.columns)}")
+        st.dataframe(points_df.head(50), use_container_width=True)
+    else:
+        st.info("No parsed lightning rows yet. Upload a .dat file.")
+
+with st.expander("Parsed storm/wind reports (CSV) — preview", expanded=True):
+    if winds_df is not None and not winds_df.empty:
+        st.write(f"Rows: {len(winds_df):,}  |  Columns: {list(winds_df.columns)}")
+        st.dataframe(winds_df.head(50), use_container_width=True)
+    else:
+        st.info("No parsed storm/wind rows yet. Upload a CSV.")
+
+# Convert to JSON strings for injection
 def df_to_js_records(df):
     return df.to_json(orient="records") if (df is not None and not df.empty) else "[]"
 
 points_js = df_to_js_records(points_df)
 winds_js  = df_to_js_records(winds_df)
 
-# ─────────────────────────── HTML (no external file links) ───────────────────────────
+# ─────────────────────────── HTML (no external data links) ───────────────────────────
 html_tpl = """
 <!DOCTYPE html>
 <html lang="en">
@@ -186,14 +197,12 @@ html_tpl = """
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Lightning Map</title>
 
-  <!-- Leaflet + plugins (no external data links) -->
+  <!-- Leaflet + plugins -->
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-
   <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css" />
   <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css" />
   <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
-
   <script src="https://unpkg.com/leaflet.heat@0.2.0/dist/leaflet-heat.js"></script>
   <script src="https://unpkg.com/leaflet-polylinedecorator@1.7.0/dist/leaflet.polylineDecorator.min.js"></script>
 
@@ -204,13 +213,7 @@ html_tpl = """
     header { padding: 12px 16px; background:#0d47a1; color:white; }
     header h2 { margin: 0; font-size: 18px; }
     #app { display:flex; min-height: calc(100vh - 48px); }
-    #sidebar {
-      width: var(--sidebar-w);
-      padding: 12px;
-      box-shadow: 2px 0 6px rgba(0,0,0,0.08);
-      z-index: 999;
-      background: #fff;
-    }
+    #sidebar { width: var(--sidebar-w); padding: 12px; box-shadow: 2px 0 6px rgba(0,0,0,0.08); z-index: 999; background: #fff; }
     #map { flex:1; width: 100%; height: 80vh; min-height: 600px; position: relative; }
     fieldset { border:1px solid #e0e0e0; border-radius:8px; margin-bottom:12px; }
     legend { padding:0 6px; font-weight:600; }
@@ -218,18 +221,10 @@ html_tpl = """
     select, input[type="number"] { width:100%; }
     .row { display:flex; gap:8px; }
     .row > div { flex:1; }
-    .summary {
-      position: absolute; top: 16px; left: 16px; background: rgba(255,255,255,0.95);
-      padding:10px; border-radius:8px; box-shadow:0 2px 6px rgba(0,0,0,0.15); font-size:12px;
-      min-width: 220px; z-index: 500;
-    }
+    .summary { position: absolute; top: 16px; left: 16px; background: rgba(255,255,255,0.95); padding:10px; border-radius:8px; box-shadow:0 2px 6px rgba(0,0,0,0.15); font-size:12px; min-width: 220px; z-index: 500; }
     .summary h4 { margin: 0 0 6px 0; font-size: 13px; }
     .stat { display:flex; justify-content: space-between; margin: 2px 0; }
-    .legend {
-      position: absolute; bottom: 16px; left: 16px; background: rgba(255,255,255,0.97);
-      padding:12px; border-radius:8px; box-shadow:0 2px 6px rgba(0,0,0,0.15); font-size:12px;
-      z-index: 500; min-width: 260px;
-    }
+    .legend { position: absolute; bottom: 16px; left: 16px; background: rgba(255,255,255,0.97); padding:12px; border-radius:8px; box-shadow:0 2px 6px rgba(0,0,0,0.15); font-size:12px; z-index: 500; min-width: 260px; }
     .legend h4 { margin: 0 0 8px 0; font-size: 13px; }
     .legend-item { display:flex; align-items:center; gap:10px; margin:6px 0; }
     .dot { width: 12px; height: 12px; border-radius: 50%; display:inline-block; border:1px solid rgba(0,0,0,0.25); }
@@ -244,30 +239,18 @@ html_tpl = """
     button { cursor:pointer; padding:8px 10px; border:1px solid #d0d0d0; background:#fafafa; border-radius:8px; }
     button:hover { background:#f0f0f0; }
     .footer-note { font-size: 11px; color:#666; margin-top:8px; }
-    @media (max-width: 980px){
-      #app { flex-direction: column; }
-      #sidebar { width: auto; box-shadow: none; border-bottom:1px solid #eee; }
-      #map { height: 70vh; min-height: 420px; }
-      .summary { position: static; margin: 8px; }
-      .legend { left: auto; right: 16px; }
-    }
   </style>
 
-  <!-- Inject uploaded data -->
   <script>
+    // Injected from Streamlit
     window.INIT_DATA = {
       points: __POINTS__,
       winds:  __WINDS__
     };
-    window.HAS_POINTS = Array.isArray(window.INIT_DATA.points) && window.INIT_DATA.points.length > 0;
-    window.HAS_WINDS  = Array.isArray(window.INIT_DATA.winds)  && window.INIT_DATA.winds.length  > 0;
   </script>
 </head>
 <body>
-  <header>
-    <h2>Lightning — Fixed Area (Emergency Response)</h2>
-  </header>
-
+  <header><h2>Lightning — Fixed Area (Emergency Response)</h2></header>
   <div id="app">
     <aside id="sidebar">
       <fieldset>
@@ -319,7 +302,6 @@ html_tpl = """
               </select>
             </div>
           </div>
-          <div class="footer-note">Path is built from storm/wind report coordinates in time order if available.</div>
         </fieldset>
 
         <fieldset>
@@ -350,7 +332,6 @@ html_tpl = """
         <div class="legend-item"><span class="cluster-badge">12</span> <span>Cluster: number = strike count</span></div>
         <div class="legend-item"><span class="wind-badge">W</span> <span>Wind report point</span></div>
         <div class="legend-item"><span class="path-swatch"></span> <span>Cyclone path (start ➜ end)</span></div>
-        <div class="legend-note">Heatmap shows density hotspots (toggle in sidebar).</div>
       </div>
     </div>
   </div>
@@ -359,7 +340,6 @@ html_tpl = """
     let map, clusterGroup, plainGroup, heatLayer, windLayer;
     let cyclonePathLayer = null, cycloneArrowLayer = null;
     let allMarkers = [];
-    let didFitToPathOnce = false;
 
     function riskColor(alt){ if (alt < 12000) return '#ffe633'; if (alt < 14000) return '#ffc300'; if (alt < 16000) return '#ff5733'; return '#c70039'; }
     function riskTier(alt){ if (alt < 12000) return 'low'; if (alt < 14000) return 'med'; if (alt < 16000) return 'high'; return 'extreme'; }
@@ -421,127 +401,28 @@ html_tpl = """
         seq.push({lat, lon, t, idx});
       });
 
-      // Cyclone path
-      const pathToggle = document.getElementById('path-toggle')?.value !== 'off';
-      const arrowsToggle = document.getElementById('arrows-toggle')?.value !== 'off';
-
-      if (!pathToggle || seq.length < 2) return;
-
-      if (window.cyclonePathLayer){ map.removeLayer(window.cyclonePathLayer); window.cyclonePathLayer = null; }
-      if (window.cycloneArrowLayer){ map.removeLayer(window.cycloneArrowLayer); window.cycloneArrowLayer = null; }
-
       const withTime = seq.filter(s => s.t instanceof Date && !isNaN(s.t));
       const noTime   = seq.filter(s => !(s.t instanceof Date) || isNaN(s.t));
       withTime.sort((a,b)=> a.t - b.t);
       const ordered = withTime.concat(noTime);
+      if (ordered.length < 2) return;
+
       const latlngs = ordered.map(o => [o.lat, o.lon]);
+      if (cyclonePathLayer){ map.removeLayer(cyclonePathLayer); cyclonePathLayer = null; }
+      if (cycloneArrowLayer){ map.removeLayer(cycloneArrowLayer); cycloneArrowLayer = null; }
 
-      window.cyclonePathLayer = L.polyline(latlngs, { color: '#0057b7', weight: 3, opacity: 0.95 }).addTo(map);
-
+      cyclonePathLayer = L.polyline(latlngs, { color: '#0057b7', weight: 3, opacity: 0.95 }).addTo(map);
       const start = latlngs[0], end = latlngs[latlngs.length - 1];
-      L.circleMarker(start, {radius:6, color:'#0057b7', fillColor:'#0057b7', fillOpacity:1})
-        .bindPopup('<b>Cyclone path start</b>').addTo(windLayer);
-      L.circleMarker(end, {radius:6, color:'#d32f2f', fillColor:'#d32f2f', fillOpacity:1})
-        .bindPopup('<b>Cyclone path end</b>').addTo(windLayer);
+      L.circleMarker(start, {radius:6, color:'#0057b7', fillColor:'#0057b7', fillOpacity:1}).bindPopup('Cyclone path start').addTo(windLayer);
+      L.circleMarker(end, {radius:6, color:'#d32f2f', fillColor:'#d32f2f', fillOpacity:1}).bindPopup('Cyclone path end').addTo(windLayer);
 
-      if (arrowsToggle && L.polylineDecorator){
-        window.cycloneArrowLayer = L.polylineDecorator(window.cyclonePathLayer, {
-          patterns: [
-            { offset: 25, repeat: 80, symbol: L.Symbol.arrowHead({ pixelSize: 10, polygon: false, pathOptions: { stroke: true, color: '#0057b7', weight: 2 }}) }
-          ]
+      if (L.polylineDecorator){
+        cycloneArrowLayer = L.polylineDecorator(cyclonePathLayer, {
+          patterns: [{ offset: 25, repeat: 80, symbol: L.Symbol.arrowHead({ pixelSize: 10, polygon: false, pathOptions: { stroke: true, color: '#0057b7', weight: 2 }}) }]
         }).addTo(map);
       }
 
-      if (!didFitToPathOnce){
-        map.fitBounds(window.cyclonePathLayer.getBounds(), { padding: [20,20] });
-        didFitToPathOnce = true;
-      }
+      map.fitBounds(cyclonePathLayer.getBounds(), { padding: [20,20] });
     }
 
-    function passAltitude(alt, range){
-      if (range==='lt12') return alt<12000;
-      if (range==='12-14') return alt>=12000 && alt<14000;
-      if (range==='14-16') return alt>=14000 && alt<16000;
-      if (range==='gt16') return alt>=16000;
-      return true;
-    }
-    function passRecent(t, mins){
-      if (!mins || mins<=0 || !t) return true;
-      const now = new Date(), cutoff = new Date(now.getTime() - mins*60*1000);
-      return t >= cutoff;
-    }
-
-    function applyFilters(){
-      const altRange = document.getElementById('altitude-filter').value;
-      const cluster = document.getElementById('cluster-toggle').value === 'on';
-      const heat = document.getElementById('heat-toggle').value === 'on';
-      const mins = parseInt(document.getElementById('recent-mins').value || '0', 10);
-
-      clusterGroup.clearLayers(); plainGroup.clearLayers();
-      if (heatLayer){ map.removeLayer(heatLayer); heatLayer = null; }
-
-      const ptsForHeat = []; let visible=0, cLow=0, cMed=0, cHigh=0, cExtreme=0;
-
-      allMarkers.forEach(o=>{
-        const ok = passAltitude(o.alt, altRange) && passRecent(o.time, mins);
-        if (ok){
-          visible++;
-          if (o.tier==='low') cLow++; else if (o.tier==='med') cMed++; else if (o.tier==='high') cHigh++; else cExtreme++;
-          if (cluster) clusterGroup.addLayer(o.marker); else plainGroup.addLayer(o.marker);
-          ptsForHeat.push([o.lat, o.lon, 0.5 + Math.min(1, Math.max(0, (o.alt-10000)/8000)) ]);
-        }
-      });
-
-      if (cluster){ if (!map.hasLayer(clusterGroup)) map.addLayer(clusterGroup); if (map.hasLayer(plainGroup)) map.removeLayer(plainGroup); }
-      else { if (!map.hasLayer(plainGroup)) map.addLayer(plainGroup); if (map.hasLayer(clusterGroup)) map.removeLayer(clusterGroup); }
-
-      if (heat){ heatLayer = L.heatLayer(ptsForHeat, { radius: 25, blur: 20, maxZoom: 11 }); heatLayer.addTo(map); }
-
-      document.getElementById('sum-visible').textContent = visible;
-      document.getElementById('sum-low').textContent = cLow;
-      document.getElementById('sum-med').textContent = cMed;
-      document.getElementById('sum-high').textContent = cHigh;
-      document.getElementById('sum-extreme').textContent = cExtreme;
-
-      setTimeout(()=>{ map.invalidateSize(); }, 150);
-    }
-
-    function downloadCSV(rows, filename) {
-      const csvContent = rows.map(r => r.map(x => (typeof x === 'string' && x.includes(',')) ? ('"' + x.replace(/"/g,'""') + '"') : x).join(",")).join("\\n");
-      const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
-      const url = URL.createObjectURL(blob); const a = document.createElement('a');
-      a.href = url; a.download = filename; document.body.appendChild(a); a.click(); document.body.removeChild(a);
-    }
-    document.getElementById('download-points').addEventListener('click', ()=>{
-      const altRange = document.getElementById('altitude-filter').value;
-      const mins = parseInt(document.getElementById('recent-mins').value || '0', 10);
-      const rows = [["lat","lon","altitude_m","tier","time_iso"]];
-      allMarkers.forEach(o=>{ if (passAltitude(o.alt, altRange) && passRecent(o.time, mins)) rows.push([o.lat, o.lon, o.alt, o.tier, o.time? o.time.toISOString(): ""]); });
-      downloadCSV(rows, "filtered_points.csv");
-    });
-
-    function reloadData(){
-      // All data is injected (no external links). Just (re)build layers from window.INIT_DATA.
-      const altRows = window.INIT_DATA.points || [];
-      const windRows = window.INIT_DATA.winds || [];
-      buildPoints(altRows); buildWindMarkers(windRows); applyFilters();
-    }
-
-    // Listeners
-    document.getElementById('altitude-filter').addEventListener('change', debounce(applyFilters, 150));
-    document.getElementById('cluster-toggle').addEventListener('change', applyFilters);
-    document.getElementById('heat-toggle').addEventListener('change', applyFilters);
-    document.getElementById('recent-mins').addEventListener('change', debounce(applyFilters, 150));
-    document.getElementById('path-toggle').addEventListener('change', reloadData);
-    document.getElementById('arrows-toggle').addEventListener('change', reloadData);
-
-    window.addEventListener('load', ()=>{ initMap(); reloadData(); });
-  </script>
-</body>
-</html>
-"""
-
-# Inject JSON safely (no f-strings)
-html_final = html_tpl.replace("__POINTS__", df_to_js_records(points_df)).replace("__WINDS__", df_to_js_records(winds_df))
-
-st_html(html_final, height=900, scrolling=True)
+    function pass
