@@ -1,341 +1,435 @@
-import os
-import pandas as pd
-import numpy as np
 import streamlit as st
-import pydeck as pdk
-from datetime import datetime, timezone
+from streamlit.components.v1 import html as st_html
+import pandas as pd
+import io
 
-# ----------------------------
-# Page config
-# ----------------------------
-st.set_page_config(page_title="Beryl Lightning Explorer", layout="wide")
-st.title("⚡ Beryl Lightning Explorer (ENTLN pulses)")
+st.set_page_config(page_title="Lightning — Fixed Area", layout="wide")
+st.markdown("#### HLMA Website")
 
-with st.sidebar:
-    st.header("Data")
-    st.write(
-        "Upload one or more ENTLN CSVs with columns like "
-        "`timestamp, latitude, longitude, peakcurrent, icheight, type`."
+# --- Uploaders ---
+col1, col2 = st.columns(2)
+with col1:
+    upl_points = st.file_uploader(
+        "Upload Lightning Points CSV (lat, lon, alt[, time])",
+        type=["csv"],
+        help="Columns expected (case/alias ok): lat/latitude, lon/longitude, alt/altitude[_m], time/timestamp/datetime"
     )
-    files = st.file_uploader("CSV files", type=["csv"], accept_multiple_files=True)
-    st.caption("Tip: apply filters for time, class (IC/CG), polarity, bbox, and |peakcurrent|.")
-    st.divider()
-    st.subheader("Map Options")
-    map_mode = st.radio(
-        "Layer",
-        ["Points", "Hexbin", "Heatmap", "3D Columns"],
-        index=0,
-        help="Switch between scatter points, hexagon density, heatmap, and 3D columns (extruded by icheight).",
+with col2:
+    upl_winds = st.file_uploader(
+        "Upload Storm/Wind Reports CSV (Lat, Lon[, Comments])",
+        type=["csv"],
+        help="Columns expected (case/alias ok): Lat/Latitude, Lon/Longitude, Comments/Remark"
     )
-    use_dark = st.checkbox("Dark basemap", value=False)
-    map_zoom = st.slider("Map zoom", 3.0, 9.0, value=5.0, step=0.5)
-    pitch = st.slider("Map pitch", 0, 60, value=30, step=5)
-    st.caption("3D modes look best with higher pitch.")
 
-# ----------------------------
-# Data loader
-# ----------------------------
-@st.cache_data(show_spinner=False)
-def load_csvs(file_objs):
-    if not file_objs:
-        return pd.DataFrame()
-    dfs = []
-    for f in file_objs:
-        try:
-            df = pd.read_csv(f)
-            df["source_file"] = getattr(f, "name", "uploaded.csv")
-            dfs.append(df)
-        except Exception as e:
-            st.warning(f"Failed to read {getattr(f, 'name', 'file')}: {e}")
-    if not dfs:
-        return pd.DataFrame()
-    df = pd.concat(dfs, ignore_index=True)
+# --- Helpers to normalize columns ---
+def _find_col(cols, aliases):
+    cols_lower = {c.lower(): c for c in cols}
+    for a in aliases:
+        if a.lower() in cols_lower:
+            return cols_lower[a.lower()]
+    return None
 
-    # Required columns
-    for col in ["timestamp", "latitude", "longitude"]:
-        if col not in df.columns:
-            st.error(f"Missing required column `{col}`")
-            return pd.DataFrame()
-
-    # Parse timestamp → UTC
-    def _parse_ts(x):
-        try:
-            return datetime.fromisoformat(str(x).replace("Z", "")).replace(tzinfo=timezone.utc)
-        except Exception:
-            return pd.NaT
-
-    df["time_utc"] = pd.to_datetime(df["timestamp"], errors="coerce", utc=True)
-    if df["time_utc"].isna().all():
-        df["time_utc"] = df["timestamp"].map(_parse_ts)
-    df = df.dropna(subset=["time_utc"]).copy()
-
-    # Numeric cleanups
-    for c in ["peakcurrent", "icheight", "type", "numbersensors", "majoraxis", "minoraxis", "bearing"]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-
-    # Heuristics from ENTLN-like schema
-    if "peakcurrent" in df.columns:
-        df["polarity"] = np.where(df["peakcurrent"] >= 0, "Positive", "Negative")
+def load_points_df(file):
+    if not file:
+        return None
+    df = pd.read_csv(file)
+    lat_c = _find_col(df.columns, ["lat", "latitude", "y", "Lat", "Latitude"])
+    lon_c = _find_col(df.columns, ["lon", "longitude", "x", "Lon", "Longitude"])
+    alt_c = _find_col(df.columns, ["alt", "altitude", "altitude_m", "alt_m", "z"])
+    time_c = _find_col(df.columns, ["time", "timestamp", "datetime", "date", "Time", "Timestamp"])
+    if not (lat_c and lon_c and alt_c):
+        st.warning("Points CSV is missing required columns (need lat, lon, alt).")
+        return None
+    out = pd.DataFrame({
+        "lat": pd.to_numeric(df[lat_c], errors="coerce"),
+        "lon": pd.to_numeric(df[lon_c], errors="coerce"),
+        "alt": pd.to_numeric(df[alt_c], errors="coerce"),
+    })
+    if time_c:
+        out["time"] = df[time_c].astype(str)
     else:
-        df["polarity"] = "Unknown"
+        out["time"] = ""
+    out = out.dropna(subset=["lat", "lon", "alt"])
+    return out
 
-    if "type" in df.columns:
-        # 0=CG, 1=IC (common ENTLN convention — adjust if your files differ)
-        df["class"] = df["type"].map({0: "CG", 1: "IC"}).astype("string").fillna("Unknown")
-    else:
-        df["class"] = "Unknown"
+def load_wind_df(file):
+    if not file:
+        return None
+    df = pd.read_csv(file)
+    lat_c = _find_col(df.columns, ["Lat", "Latitude", "lat", "latitude", "y"])
+    lon_c = _find_col(df.columns, ["Lon", "Longitude", "lon", "longitude", "x"])
+    com_c = _find_col(df.columns, ["Comments", "Comment", "Remark", "Remarks", "Desc", "Description"])
+    if not (lat_c and lon_c):
+        st.info("Storm report CSV has no Lat/Lon columns; wind layer will be empty.")
+        return None
+    out = pd.DataFrame({
+        "Lat": pd.to_numeric(df[lat_c], errors="coerce"),
+        "Lon": pd.to_numeric(df[lon_c], errors="coerce"),
+        "Comments": df[com_c].astype(str) if com_c else "",
+    }).dropna(subset=["Lat", "Lon"])
+    return out
 
-    # Convenience columns
-    df["hour"] = df["time_utc"].dt.floor("h")
-    df["minute"] = df["time_utc"].dt.floor("min")
+points_df = load_points_df(upl_points) if upl_points else None
+winds_df  = load_wind_df(upl_winds) if upl_winds else None
 
-    return df
+# Convert to JSON (compact) for injection into the HTML
+def df_to_js_records(df):
+    if df is None or df.empty:
+        return "[]"
+    # Build a minimal CSV then parse in JS? Not needed—just dump to JSON-like string safely.
+    # We'll do a very compact JSON to keep component size reasonable.
+    return df.to_json(orient="records")
 
-df = load_csvs(files)
-if df.empty:
-    st.info("Upload CSVs to begin.")
-    st.stop()
+points_js = df_to_js_records(points_df)
+winds_js  = df_to_js_records(winds_df)
 
-# ----------------------------
-# Global ranges & summary
-# ----------------------------
-min_t, max_t = df["time_utc"].min(), df["time_utc"].max()
-min_lat, max_lat = float(df["latitude"].min()), float(df["latitude"].max())
-min_lon, max_lon = float(df["longitude"].min()), float(df["longitude"].max())
+# --- HTML/JS App (uses INIT_DATA if provided; else falls back to GitHub CSVs) ---
+st_html(f'''<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lightning Map</title>
 
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("Total pulses", f"{len(df):,}")
-m2.metric("Time span (UTC)", f"{min_t:%Y-%m-%d %H:%M} → {max_t:%Y-%m-%d %H:%M}")
-m3.metric("Lat range", f"{min_lat:.2f} … {max_lat:.2f}")
-m4.metric("Lon range", f"{min_lon:.2f} … {max_lon:.2f}")
+  <!-- Leaflet -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 
-st.divider()
-st.subheader("Filters")
+  <!-- Leaflet.markercluster -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css" />
+  <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
 
-# --- Time slider (robust tz handling: slider uses NAIVE, filter uses UTC-aware)
-def _naive(ts):
-    if hasattr(ts, "tz") and ts.tz is not None:
-        return ts.tz_convert("UTC").tz_localize(None).to_pydatetime()
-    return pd.Timestamp(ts).to_pydatetime()
+  <!-- Leaflet.heat -->
+  <script src="https://unpkg.com/leaflet.heat@0.2.0/dist/leaflet-heat.js"></script>
 
-t_start, t_end = st.slider(
-    "Time window (UTC)",
-    min_value=_naive(min_t),
-    max_value=_naive(max_t),
-    value=(_naive(min_t), _naive(max_t)),
-    format="YYYY-MM-DD HH:mm",
-)
+  <!-- PapaParse (fallback fetch only) -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.3.0/papaparse.min.js"></script>
 
-c1, c2, c3, c4 = st.columns([2, 2, 2, 2])
-with c1:
-    classes = sorted(df["class"].unique().tolist())
-    class_sel = st.multiselect("Class", classes, default=classes)
-with c2:
-    pols = sorted(df["polarity"].unique().tolist())
-    pol_sel = st.multiselect("Polarity", pols, default=pols)
-with c3:
-    peak_abs_max = float(np.nanmax(np.abs(df.get("peakcurrent", pd.Series([0])))))
-    peak_kA = st.slider("Abs(peakcurrent) ≥ (kA)", 0.0, max(1.0, peak_abs_max / 1000.0), value=0.0, step=0.1)
-with c4:
-    agg_choice = st.radio("Playback bucket", ["Minute", "Hour", "Day"], horizontal=True, index=1)
+  <style>
+    :root {{ --sidebar-w: 320px; }}
+    html, body {{ height: 100%; }}
+    body {{ margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }}
+    header {{ padding: 12px 16px; background:#0d47a1; color:white; }}
+    header h2 {{ margin: 0; font-size: 18px; }}
+    #app {{ display:flex; min-height: calc(100vh - 48px); }}
+    #sidebar {{
+      width: var(--sidebar-w);
+      padding: 12px;
+      box-shadow: 2px 0 6px rgba(0,0,0,0.08);
+      z-index: 999;
+      background: #fff;
+    }}
+    #map {{ flex:1; width: 100%; height: 80vh; min-height: 600px; position: relative; }}
+    fieldset {{ border:1px solid #e0e0e0; border-radius:8px; margin-bottom:12px; }}
+    legend {{ padding:0 6px; font-weight:600; }}
+    label {{ display:block; margin:8px 0 4px; font-size: 13px; }}
+    select, input[type="number"] {{ width:100%; }}
+    .row {{ display:flex; gap:8px; }}
+    .row > div {{ flex:1; }}
+    .summary {{
+      position: absolute; top: 16px; left: 16px; background: rgba(255,255,255,0.95);
+      padding:10px; border-radius:8px; box-shadow:0 2px 6px rgba(0,0,0,0.15); font-size:12px;
+      min-width: 220px; z-index: 500;
+    }}
+    .summary h4 {{ margin: 0 0 6px 0; font-size: 13px; }}
+    .stat {{ display:flex; justify-content: space-between; margin: 2px 0; }}
+    .legend {{
+      position: absolute; bottom: 16px; left: 16px; background: rgba(255,255,255,0.97);
+      padding:12px; border-radius:8px; box-shadow:0 2px 6px rgba(0,0,0,0.15); font-size:12px;
+      z-index: 500; min-width: 240px;
+    }}
+    .legend h4 {{ margin: 0 0 8px 0; font-size: 13px; }}
+    .legend-item {{ display:flex; align-items:center; gap:10px; margin:6px 0; }}
+    .dot {{ width: 12px; height: 12px; border-radius: 50%; display:inline-block; border:1px solid rgba(0,0,0,0.25); }}
+    .dot.low {{ background:#ffe633; }}
+    .dot.med {{ background:#ffc300; }}
+    .dot.high {{ background:#ff5733; }}
+    .dot.extreme {{ background:#c70039; }}
+    .cluster-badge {{
+      display:inline-flex; align-items:center; justify-content:center;
+      width: 22px; height: 22px; border-radius: 50%;
+      background:#1976d2; color:#fff; font-weight:700; font-size:11px; border:1px solid rgba(0,0,0,0.2);
+    }}
+    .wind-badge {{
+      display:inline-block; color:blue; font-weight:700; font-size:16px; line-height:1;
+    }}
+    .legend-note {{ color:#555; font-size:11px; margin-top:6px; }}
+    button {{ cursor:pointer; padding:8px 10px; border:1px solid #d0d0d0; background:#fafafa; border-radius:8px; }}
+    button:hover {{ background:#f0f0f0; }}
+    .footer-note {{ font-size: 11px; color:#666; margin-top:8px; }}
+    @media (max-width: 980px){{
+      #app {{ flex-direction: column; }}
+      #sidebar {{ width: auto; box-shadow: none; border-bottom:1px solid #eee; }}
+      #map {{ height: 70vh; min-height: 420px; }}
+      .summary {{ position: static; margin: 8px; }}
+      .legend {{ left: auto; right: 16px; }}
+    }}
+  </style>
 
-b1, b2, b3, b4 = st.columns(4)
-with b1:
-    lat_min_f = st.number_input("Lat min", value=min_lat, step=0.1)
-with b2:
-    lat_max_f = st.number_input("Lat max", value=max_lat, step=0.1)
-with b3:
-    lon_min_f = st.number_input("Lon min", value=min_lon, step=0.1)
-with b4:
-    lon_max_f = st.number_input("Lon max", value=max_lon, step=0.1)
+  <!-- Inject uploaded data here -->
+  <script>
+    window.INIT_DATA = {{
+      points: {points_js},
+      winds:  {winds_js}
+    }};
+    // Flags for availability
+    window.HAS_POINTS = Array.isArray(window.INIT_DATA.points) && window.INIT_DATA.points.length > 0;
+    window.HAS_WINDS  = Array.isArray(window.INIT_DATA.winds)  && window.INIT_DATA.winds.length  > 0;
+  </script>
+</head>
+<body>
+  <header>
+    <h2>Lightning — Fixed Area (Emergency Response)</h2>
+  </header>
 
-def _to_utc(x):
-    ts = pd.Timestamp(x)
-    return ts.tz_localize("UTC") if ts.tz is None else ts.tz_convert("UTC")
+  <div id="app">
+    <aside id="sidebar">
+      <fieldset>
+        <legend>Filters</legend>
+        <label for="altitude-filter">Altitude range</label>
+        <select id="altitude-filter">
+          <option value="all">All</option>
+          <option value="lt12">&lt; 12 km</option>
+          <option value="12-14">12–14 km</option>
+          <option value="14-16">14–16 km (Danger)</option>
+          <option value="gt16">&gt; 16 km</option>
+        </select>
 
-mask = (
-    (df["time_utc"] >= _to_utc(t_start)) &
-    (df["time_utc"] <= _to_utc(t_end)) &
-    (df["latitude"].between(lat_min_f, lat_max_f)) &
-    (df["longitude"].between(lon_min_f, lon_max_f)) &
-    (df["class"].isin(class_sel)) &
-    (df["polarity"].isin(pol_sel))
-)
-if "peakcurrent" in df.columns:
-    mask &= (np.abs(df["peakcurrent"]) >= (peak_kA * 1000.0))
+        <div class="row">
+          <div>
+            <label for="cluster-toggle">Marker clustering</label>
+            <select id="cluster-toggle">
+              <option value="on">On</option>
+              <option value="off">Off</option>
+            </select>
+          </div>
+          <div>
+            <label for="heat-toggle">Heatmap</label>
+            <select id="heat-toggle">
+              <option value="off">Off</option>
+              <option value="on">On</option>
+            </select>
+          </div>
+        </div>
 
-view = df.loc[mask].copy()
-st.success(f"Filtered pulses: {len(view):,}")
+        <label for="recent-mins">Show strikes from last (minutes)</label>
+        <input type="number" id="recent-mins" min="0" step="5" value="0" />
 
-# ----------------------------
-# Playback bucketing
-# ----------------------------
-if agg_choice == "Minute":
-    view["bucket"] = view["time_utc"].dt.floor("min")
-elif agg_choice == "Hour":
-    view["bucket"] = view["time_utc"].dt.floor("h")
-else:
-    view["bucket"] = view["time_utc"].dt.floor("d")
+        <fieldset>
+          <legend>Auto-refresh</legend>
+          <div class="row">
+            <div>
+              <label for="auto-refresh">Enable</label>
+              <select id="auto-refresh">
+                <option value="off">Off</option>
+                <option value="on">On</option>
+              </select>
+            </div>
+            <div>
+              <label for="refresh-sec">Every (seconds)</label>
+              <input type="number" id="refresh-sec" min="30" step="30" value="120" />
+            </div>
+          </div>
+          <div class="footer-note" id="refresh-note">Auto-refresh is off.</div>
+        </fieldset>
 
-frames = sorted(view["bucket"].dropna().unique())
-if frames:
-    frame_idx = st.slider(
-        "Frame", 0, max(0, len(frames) - 1), value=0, step=1,
-        help="Scrub through time buckets to inspect evolution."
-    )
-    frame_time = frames[frame_idx]
-    frame_view = view.loc[view["bucket"] == frame_time].copy()
-else:
-    frame_time = None
-    frame_view = view.copy()
+        <fieldset>
+          <legend>Downloads</legend>
+          <button id="download-points">Download filtered points (CSV)</button>
+        </fieldset>
 
-# IMPORTANT: avoid tz objects in Deck data — use a string for tooltips
-frame_view["time_str"] = frame_view["time_utc"].dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+        <div class="footer-note">
+          If no uploads provided, falls back to GitHub sample CSVs. Tiles © OpenStreetMap.
+        </div>
+      </fieldset>
+    </aside>
 
-st.caption(f"Current frame: {frame_time}" if frame_time is not None else "Current frame: (all)")
+    <div id="map">
+      <div class="summary" id="summary">
+        <h4>Strike Summary</h4>
+        <div class="stat"><span>Total (all data):</span><strong id="sum-total">0</strong></div>
+        <div class="stat"><span>Visible (filters):</span><strong id="sum-visible">0</strong></div>
+        <hr>
+        <div class="stat"><span>&lt; 12 km:</span><strong id="sum-low">0</strong></div>
+        <div class="stat"><span>12–14 km:</span><strong id="sum-med">0</strong></div>
+        <div class="stat"><span>14–16 km:</span><strong id="sum-high">0</strong></div>
+        <div class="stat"><span>&gt; 16 km:</span><strong id="sum-extreme">0</strong></div>
+      </div>
 
-# ----------------------------
-# Time series (counts)
-# ----------------------------
-st.subheader("Temporal structure")
-ts = view.groupby("bucket").size().rename("count").reset_index()
-st.line_chart(ts.set_index("bucket"))
+      <div class="legend" id="legend">
+        <h4>Legend</h4>
+        <div class="legend-item"><span class="dot low"></span> <span>Low altitude (&lt; 12 km)</span></div>
+        <div class="legend-item"><span class="dot med"></span> <span>Medium (12–14 km)</span></div>
+        <div class="legend-item"><span class="dot high"></span> <span>High / Danger (14–16 km)</span></div>
+        <div class="legend-item"><span class="dot extreme"></span> <span>Extreme (&gt; 16 km)</span></div>
+        <div class="legend-item"><span class="cluster-badge">12</span> <span>Cluster: number = strike count</span></div>
+        <div class="legend-item"><span class="wind-badge">W</span> <span>Wind report</span></div>
+        <div class="legend-note">Heatmap shows density hotspots (toggle in sidebar).</div>
+      </div>
+    </div>
+  </div>
 
-# ----------------------------
-# Map
-# ----------------------------
-st.subheader("Map")
+  <script>
+    let map, clusterGroup, plainGroup, heatLayer, windLayer;
+    let allMarkers = [];
+    let refreshTimer = null;
 
-if frame_view.empty:
-    st.info("No data in this frame with the chosen filters.")
-    st.stop()
+    function riskColor(alt){{ if (alt < 12000) return '#ffe633'; if (alt < 14000) return '#ffc300'; if (alt < 16000) return '#ff5733'; return '#c70039'; }}
+    function riskTier(alt){{ if (alt < 12000) return 'low'; if (alt < 14000) return 'med'; if (alt < 16000) return 'high'; return 'extreme'; }}
+    function debounce(fn, ms){{ let t; return function(){{ clearTimeout(t); t = setTimeout(()=>fn.apply(this, arguments), ms); }}; }}
+    function parseTime(val){{ if (!val) return null; if (!isNaN(val)) {{ const n=Number(val); if (n>1e10) return new Date(n); }} const d=new Date(val); return isNaN(d.getTime())?null:d; }}
 
-# Center + style
-center_lat = float(frame_view["latitude"].median()) if not frame_view.empty else (min_lat + max_lat) / 2
-center_lon = float(frame_view["longitude"].median()) if not frame_view.empty else (min_lon + max_lon) / 2
-map_style = "mapbox://styles/mapbox/dark-v11" if use_dark else "mapbox://styles/mapbox/light-v10"
-init_view = pdk.ViewState(latitude=center_lat, longitude=center_lon, zoom=map_zoom, pitch=pitch)
+    // Data loaders: prefer injected INIT_DATA, else fallback to GitHub CSVs
+    function loadAltitudeData(){{
+      if (window.HAS_POINTS) return Promise.resolve(window.INIT_DATA.points);
+      return new Promise((resolve, reject)=>{{
+        Papa.parse('https://raw.githubusercontent.com/kyo330/HLMA/main/filtered_LYLOUT_230924_210000_0600.csv', {{
+          download:true, header:true, complete: (res)=>resolve(res.data), error: reject
+        }});
+      }});
+    }}
+    function loadWindData(){{
+      if (window.HAS_WINDS) return Promise.resolve(window.INIT_DATA.winds);
+      return new Promise((resolve, reject)=>{{
+        Papa.parse('https://raw.githubusercontent.com/kyo330/HLMA/main/230924_rpts_wind.csv', {{
+          download:true, header:true, complete: (res)=>resolve(res.data), error: reject
+        }});
+      }});
+    }}
 
-# Marker sizes by |I|
-if "peakcurrent" in frame_view.columns:
-    size = np.clip(np.log1p(np.abs(frame_view["peakcurrent"])).replace([np.inf, -np.inf], np.nan).fillna(0), 1, None)
-else:
-    size = pd.Series(5, index=frame_view.index)
+    function initMap(){{
+      map = L.map('map').setView([30.7, -95.2], 8);
+      L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{ attribution: '© OpenStreetMap contributors' }}).addTo(map);
+      clusterGroup = L.markerClusterGroup({{ disableClusteringAtZoom: 12 }});
+      plainGroup = L.layerGroup();
+      windLayer = L.layerGroup().addTo(map);
+      setTimeout(()=>{{ map.invalidateSize(); }}, 300);
+    }}
 
-# Robust color mapping (no fillna(list))
-color_map = {"IC": [0, 128, 255, 140], "CG": [255, 80, 0, 160]}
-default_color = [180, 180, 180, 140]
-class_series = frame_view["class"].astype("string").fillna("Unknown")
-mapped = class_series.map(color_map)
-color = mapped.apply(lambda v: v if isinstance(v, list) else default_color)
+    function buildPoints(rows){{
+      allMarkers = []; clusterGroup.clearLayers(); plainGroup.clearLayers();
+      rows.forEach(r=>{{
+        // accept both injected schema and fallback schema
+        const lat = parseFloat(r.lat ?? r.Lat ?? r.latitude ?? r.Latitude);
+        const lon = parseFloat(r.lon ?? r.Lon ?? r.longitude ?? r.Longitude);
+        const alt = parseFloat(r.alt ?? r.altitude ?? r.altitude_m ?? r.Alt ?? r.Altitude);
+        const t = parseTime(r.time ?? r.Time ?? r.timestamp ?? r.Timestamp ?? r.datetime ?? r.Date);
+        if (isNaN(lat) || isNaN(lon) || isNaN(alt)) return;
+        const color = riskColor(alt), tier = riskTier(alt);
+        const m = L.circleMarker([lat, lon], {{
+          radius: tier==='low'?3:tier==='med'?5:tier==='high'?7:9,
+          color, fillColor: color, fillOpacity: 0.85, opacity: 1, weight: 1
+        }}).bindPopup(
+          `<b>Altitude:</b> ${{alt}} m<br><b>Tier:</b> ${{tier.toUpperCase()}}<br>` +
+          (t? `<b>Time:</b> ${{t.toISOString()}}<br>`:'' ) + `(${{lat.toFixed(3)}}, ${{lon.toFixed(3)}})`
+        );
+        allMarkers.push({{marker: m, alt, time: t, lat, lon, tier}});
+      }});
+      allMarkers.forEach(o=>clusterGroup.addLayer(o.marker));
+      if (!map.hasLayer(clusterGroup)) clusterGroup.addTo(map);
+      document.getElementById('sum-total').textContent = allMarkers.length;
+    }}
 
-layers = []
+    function buildWindMarkers(rows){{
+      windLayer.clearLayers();
+      rows.forEach(r=>{{
+        const lat = parseFloat(r.Lat ?? r.lat ?? r.Latitude ?? r.latitude);
+        const lon = parseFloat(r.Lon ?? r.lon ?? r.Longitude ?? r.longitude);
+        const comments = r.Comments ?? r.Comment ?? r.Remark ?? r.Description ?? '';
+        if (isNaN(lat) || isNaN(lon)) return;
+        L.marker([lat, lon], {{
+          icon: L.divIcon({{ className:'wind-icon', html:'<span style="color:blue; font-weight:700; font-size:20px;">W</span>', iconSize:[24,24], iconAnchor:[12,12] }})
+        }}).bindPopup(`<b>Wind Event:</b> ${{comments || 'N/A'}}<br>(${{lat.toFixed(3)}}, ${{lon.toFixed(3)}})`).addTo(windLayer);
+      }});
+    }}
 
-if map_mode == "Points":
-    layers.append(
-        pdk.Layer(
-            "ScatterplotLayer",
-            data=frame_view.assign(size=size, color=list(color)),
-            get_position=["longitude", "latitude"],
-            get_color="color",
-            get_radius="size*500",
-            pickable=True,
-            radius_min_pixels=1,
-            auto_highlight=True,
-        )
-    )
+    function passAltitude(alt, range){{
+      if (range==='lt12') return alt<12000;
+      if (range==='12-14') return alt>=12000 && alt<14000;
+      if (range==='14-16') return alt>=14000 && alt<16000;
+      if (range==='gt16') return alt>=16000;
+      return true;
+    }}
+    function passRecent(t, mins){{
+      if (!mins || mins<=0 || !t) return true;
+      const now = new Date(), cutoff = new Date(now.getTime() - mins*60*1000);
+      return t >= cutoff;
+    }}
 
-elif map_mode == "Hexbin":
-    layers.append(
-        pdk.Layer(
-            "HexagonLayer",
-            data=frame_view,
-            get_position=["longitude", "latitude"],
-            elevation_scale=10,
-            elevation_range=[0, 1000],
-            extruded=True,
-            opacity=0.6,
-            coverage=1,
-            radius=10000,  # meters
-            pickable=True,
-        )
-    )
+    function applyFilters(){{
+      const altRange = document.getElementById('altitude-filter').value;
+      const cluster = document.getElementById('cluster-toggle').value === 'on';
+      const heat = document.getElementById('heat-toggle').value === 'on';
+      const mins = parseInt(document.getElementById('recent-mins').value || '0', 10);
 
-elif map_mode == "Heatmap":
-    layers.append(
-        pdk.Layer(
-            "HeatmapLayer",
-            data=frame_view,
-            get_position=["longitude", "latitude"],
-            # NOTE: removed aggregation=pdk.types.String("MEAN") to avoid serialization issues
-        )
-    )
+      clusterGroup.clearLayers(); plainGroup.clearLayers();
+      if (heatLayer){{ map.removeLayer(heatLayer); heatLayer = null; }}
 
-elif map_mode == "3D Columns":
-    # Extrude by icheight (scaled). Fallback for missing heights.
-    height_km = (frame_view.get("icheight", pd.Series([0] * len(frame_view), index=frame_view.index)) / 1000.0)
-    height_km = height_km.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    scaled_h = (height_km * 10000.0).clip(0, 20000)  # scale for visibility
-    layers.append(
-        pdk.Layer(
-            "ColumnLayer",
-            data=frame_view.assign(col_elev=scaled_h, color=list(color)),
-            get_position=["longitude", "latitude"],
-            get_elevation="col_elev",
-            elevation_scale=1,
-            radius=3000,  # meters
-            get_fill_color="color",
-            pickable=True,
-            extruded=True,
-        )
-    )
+      const ptsForHeat = []; let visible=0, cLow=0, cMed=0, cHigh=0, cExtreme=0;
 
-tooltip = {
-    # use time_str (plain string) to avoid tz-aware objects in deck JSON
-    "text": "{class} | {polarity}\n{time_str}\nI: {peakcurrent} A\nh: {icheight} m"
-}
+      allMarkers.forEach(o=>{{
+        const ok = passAltitude(o.alt, altRange) && passRecent(o.time, mins);
+        if (ok){{
+          visible++;
+          if (o.tier==='low') cLow++; else if (o.tier==='med') cMed++; else if (o.tier==='high') cHigh++; else cExtreme++;
+          if (cluster) clusterGroup.addLayer(o.marker); else plainGroup.addLayer(o.marker);
+          ptsForHeat.push([o.lat, o.lon, 0.5 + Math.min(1, Math.max(0, (o.alt-10000)/8000)) ]);
+        }}
+      }});
 
-st.pydeck_chart(
-    pdk.Deck(
-        map_style=map_style,
-        initial_view_state=init_view,
-        layers=layers,
-        tooltip=tooltip,
-    )
-)
+      if (cluster){{ if (!map.hasLayer(clusterGroup)) map.addLayer(clusterGroup); if (map.hasLayer(plainGroup)) map.removeLayer(plainGroup); }}
+      else {{ if (!map.hasLayer(plainGroup)) map.addLayer(plainGroup); if (map.hasLayer(clusterGroup)) map.removeLayer(clusterGroup); }}
 
-# ----------------------------
-# Distributions
-# ----------------------------
-st.subheader("Distributions")
-d1, d2, d3 = st.columns(3)
-with d1:
-    if "peakcurrent" in view.columns:
-        st.caption("Peak current (kA)")
-        st.bar_chart((view["peakcurrent"] / 1000.0).dropna())
-with d2:
-    if "icheight" in view.columns:
-        st.caption("In-cloud height (km)")
-        st.bar_chart((view["icheight"] / 1000.0).dropna())
-with d3:
-    st.caption("Class share")
-    st.bar_chart(view["class"].value_counts())
+      if (heat){{ heatLayer = L.heatLayer(ptsForHeat, {{ radius: 25, blur: 20, maxZoom: 11 }}); heatLayer.addTo(map); }}
 
-# ----------------------------
-# Download filtered subset
-# ----------------------------
-st.subheader("Download filtered data")
+      document.getElementById('sum-visible').textContent = visible;
+      document.getElementById('sum-low').textContent = cLow;
+      document.getElementById('sum-med').textContent = cMed;
+      document.getElementById('sum-high').textContent = cHigh;
+      document.getElementById('sum-extreme').textContent = cExtreme;
 
-@st.cache_data
-def to_csv_bytes(_df):
-    return _df.to_csv(index=False).encode("utf-8")
+      setTimeout(()=>{{ map.invalidateSize(); }}, 150);
+    }}
 
-st.download_button(
-    "Download CSV (filtered)",
-    data=to_csv_bytes(view),
-    file_name="beryl_filtered.csv",
-    mime="text/csv",
-)
+    function downloadCSV(rows, filename) {{
+      const csvContent = rows.map(r => r.map(x => (typeof x === 'string' && x.includes(',')) ? ('"' + x.replace(/"/g,'""') + '"') : x).join(",")).join("\\n");
+      const blob = new Blob([csvContent], {{ type: "text/csv;charset=utf-8;" }});
+      const url = URL.createObjectURL(blob); const a = document.createElement('a');
+      a.href = url; a.download = filename; document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    }}
+    document.getElementById('download-points').addEventListener('click', ()=>{
+      const altRange = document.getElementById('altitude-filter').value;
+      const mins = parseInt(document.getElementById('recent-mins').value || '0', 10);
+      const rows = [["lat","lon","altitude_m","tier","time_iso"]];
+      allMarkers.forEach(o=>{{ if (passAltitude(o.alt, altRange) && passRecent(o.time, mins)) rows.push([o.lat, o.lon, o.alt, o.tier, o.time? o.time.toISOString(): ""]); }});
+      downloadCSV(rows, "filtered_points.csv");
+    });
 
-st.caption("© Streamlit app for Tropical Cyclone Beryl lightning pulses (ENTLN).")
+    function setAutoRefresh(enabled, seconds){{
+      const note = document.getElementById('refresh-note');
+      if (refreshTimer){{ clearInterval(refreshTimer); refreshTimer = null; }}
+      if (!enabled){{ note.textContent = 'Auto-refresh is off.'; return; }}
+      note.textContent = 'Auto-refresh every ' + seconds + ' seconds.';
+      // With local uploads there's nothing to "re-fetch" unless page reloads; keep for fallback demo
+      refreshTimer = setInterval(()=>{{ reloadData(); }}, Math.max(30, seconds) * 1000);
+    }}
+
+    function reloadData(){{
+      Promise.all([loadAltitudeData(), loadWindData()]).then(([altRows, windRows])=>{
+        buildPoints(altRows || []); buildWindMarkers(windRows || []); applyFilters();
+      }).catch(err=>{{ console.error('Data reload error:', err); }});
+    }}
+
+    document.getElementById('altitude-filter').addEventListener('change', debounce(applyFilters, 150));
+    document.getElementById('cluster-toggle').addEventListener('change', applyFilters);
+    document.getElementById('heat-toggle').addEventListener('change', applyFilters);
+    document.getElementById('recent-mins').addEventListener('change', debounce(applyFilters, 150));
+    document.getElementById('auto-refresh').addEventListener('change', ()=>{{ const on = document.getElementById('auto-refresh').value==='on'; const sec = parseInt(document.getElementById('refresh-sec').value||'120',10); setAutoRefresh(on, sec); }});
+    document.getElementById('refresh-sec').addEventListener('change', ()=>{{ const on = document.getElementById('auto-refresh').value==='on'; const sec = parseInt(document.getElementById('refresh-sec').value||'120',10); setAutoRefresh(on, sec); }});
+
+    window.addEventListener('load', ()=>{{ initMap(); reloadData(); }});
+  </script>
+</body>
+</html>
+''', height=900, scrolling=True)
